@@ -27,7 +27,7 @@ enum Command {
         sql: Option<String>,
         #[arg(short, long, default_value = "generic")]
         dialect: Dialect,
-        /// Read SQL from a file instead of a literal argument
+        /// Read SQL from a file
         #[arg(short, long)]
         file: Option<String>,
     },
@@ -38,10 +38,10 @@ enum Command {
         sql: Option<String>,
         #[arg(short, long, default_value = "generic")]
         dialect: Dialect,
-        /// Read SQL from a file instead of a literal argument
+        /// Read SQL from a file
         #[arg(short, long)]
         file: Option<String>,
-        /// Output format
+        /// Output format: json-pretty (default), json, yaml, tree
         #[arg(short, long, default_value = "json-pretty")]
         output: OutputFormat,
     },
@@ -52,7 +52,7 @@ enum Command {
         sql: Option<String>,
         #[arg(short, long, default_value = "generic")]
         dialect: Dialect,
-        /// Read SQL from a file instead of a literal argument
+        /// Read SQL from a file
         #[arg(short, long)]
         file: Option<String>,
         /// Suppress success output (only print errors)
@@ -60,7 +60,13 @@ enum Command {
         quiet: bool,
     },
 
-    /// Diff the ASTs of two SQL strings
+    // FUTURE: diff — compare ASTs of two SQL strings
+    //   sql-cli diff "SELECT a FROM t" "SELECT a, b FROM t"
+    //   Outputs a line-level diff of the normalised SQL and AST JSON
+
+    // FUTURE: repl — interactive readline session
+    //   sql-cli repl [--dialect postgresql]
+    //   Commands: :ast  :ast-yaml  :ast-tree  :fmt  :validate  :dialect <d>  :help  :quit
     Diff {
         /// First SQL string (or path with --file1)
         sql1: Option<String>,
@@ -156,30 +162,29 @@ impl Dialect {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve SQL input: explicit string → file → stdin (in that order).
+/// Resolve SQL input: explicit string → file → stdin.
 fn resolve_sql(sql: Option<String>, file: Option<String>) -> Result<String, String> {
-    if let Some(s) = sql {
-        return Ok(s);
-    }
+    if let Some(s) = sql { return Ok(s); }
     if let Some(path) = file {
         return std::fs::read_to_string(&path)
             .map_err(|e| format!("Cannot read '{}': {e}", path));
     }
     use std::io::Read;
     let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| format!("stdin error: {e}"))?;
+    std::io::stdin().read_to_string(&mut buf).map_err(|e| format!("stdin error: {e}"))?;
     Ok(buf)
 }
 
-/// Parse (supports multiple `;`-separated statements).
+/// Parse one or more `;`-separated statements.
 fn parse(sql: &str, dialect: &Dialect) -> Result<Vec<Statement>, String> {
     SqlParser::parse_sql(dialect.as_boxed().as_ref(), sql)
-        .map_err(|e| format!("{}", e))
+        .map_err(|e| e.to_string())
 }
 
-/// Render AST in the requested output format.
+// ─────────────────────────────────────────────────────────────────────────────
+// AST rendering
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn render_ast(stmts: &[Statement], fmt: &OutputFormat) -> Result<String, String> {
     match fmt {
         OutputFormat::JsonPretty =>
@@ -187,46 +192,53 @@ fn render_ast(stmts: &[Statement], fmt: &OutputFormat) -> Result<String, String>
         OutputFormat::Json =>
             serde_json::to_string(stmts).map_err(|e| e.to_string()),
         OutputFormat::Yaml =>
-            serde_yaml::to_string(stmts).map_err(|e| format!("YAML output not supported for this query (sqlparser AST uses nested enums unsupported by serde_yaml): {e}")),
+            render_yaml(stmts),
         OutputFormat::Tree =>
             Ok(render_tree(stmts)),
     }
 }
 
-/// Simple recursive tree renderer using the JSON value as a proxy.
+/// YAML output: convert to serde_json::Value first (avoids serde_yaml's
+/// "nested enum" limitation), then serialise via serde_yaml.
+fn render_yaml(stmts: &[Statement]) -> Result<String, String> {
+    let json_val: serde_json::Value =
+        serde_json::to_value(stmts).map_err(|e| e.to_string())?;
+    // Round-trip through serde_yaml::Value so we get clean YAML
+    let yaml_val: serde_yaml::Value =
+        serde_yaml::to_value(&json_val).map_err(|e| e.to_string())?;
+    serde_yaml::to_string(&yaml_val).map_err(|e| e.to_string())
+}
+
+// ─── Tree renderer ────────────────────────────────────────────────────────────
+
 fn render_tree(stmts: &[Statement]) -> String {
     let val = serde_json::to_value(stmts).unwrap_or(serde_json::Value::Null);
     let mut out = String::new();
-    render_value(&val, &mut out, "", true);
+    render_node(&val, &mut out, "");
     out
 }
 
-fn render_value(val: &serde_json::Value, out: &mut String, prefix: &str, last: bool) {
-    let connector = if last { "└── " } else { "├── " };
-    let child_prefix = if last { "    " } else { "│   " };
-
+/// Recursively render a JSON value as a tree, tracking the indent prefix.
+fn render_node(val: &serde_json::Value, out: &mut String, prefix: &str) {
     match val {
         serde_json::Value::Object(map) => {
-            for (i, (k, v)) in map.iter().enumerate() {
-                let is_last = i == map.len() - 1;
+            let entries: Vec<_> = map.iter()
+                .filter(|(_, v)| !v.is_null())   // skip null fields
+                .collect();
+            for (i, (k, v)) in entries.iter().enumerate() {
+                let last = i == entries.len() - 1;
+                let (branch, child_prefix) = branch_chars(prefix, last);
                 match v {
                     serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        out.push_str(&format!(
-                            "{}{}{}\n",
-                            prefix,
-                            if i == 0 { connector } else { if last { "    " } else { "│   " } },
-                            k.cyan().bold()
-                        ));
-                        render_value(v, out, &format!("{}{}", prefix, child_prefix), is_last);
+                        out.push_str(&format!("{}{}\n", branch, k.cyan().bold()));
+                        render_node(v, out, &child_prefix);
                     }
-                    serde_json::Value::Null => {}
                     _ => {
                         out.push_str(&format!(
-                            "{}{}{}: {}\n",
-                            prefix,
-                            if i == 0 { connector } else { if last { "    " } else { "│   " } },
+                            "{}{}: {}\n",
+                            branch,
                             k.cyan(),
-                            format!("{}", v).green()
+                            scalar_str(v).green()
                         ));
                     }
                 }
@@ -234,22 +246,41 @@ fn render_value(val: &serde_json::Value, out: &mut String, prefix: &str, last: b
         }
         serde_json::Value::Array(arr) => {
             for (i, item) in arr.iter().enumerate() {
-                let is_last = i == arr.len() - 1;
-                let idx = format!("[{}]", i).yellow().to_string();
+                let last = i == arr.len() - 1;
+                let (branch, child_prefix) = branch_chars(prefix, last);
                 match item {
                     serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        out.push_str(&format!("{}{}{}\n", prefix, connector, idx));
-                        render_value(item, out, &format!("{}{}", prefix, child_prefix), is_last);
+                        out.push_str(&format!("{}[{}]\n", branch, i.to_string().yellow()));
+                        render_node(item, out, &child_prefix);
                     }
                     _ => {
-                        out.push_str(&format!("{}{}{}: {}\n", prefix, connector, idx, format!("{}", item).green()));
+                        out.push_str(&format!(
+                            "{}[{}] {}\n",
+                            branch,
+                            i.to_string().yellow(),
+                            scalar_str(item).green()
+                        ));
                     }
                 }
             }
         }
         other => {
-            out.push_str(&format!("{}{}{}\n", prefix, connector, format!("{}", other).green()));
+            out.push_str(&format!("{}{}\n", prefix, scalar_str(other).green()));
         }
+    }
+}
+
+/// Returns (branch_line, child_indent_prefix) for tree drawing.
+fn branch_chars(parent_prefix: &str, last: bool) -> (String, String) {
+    let branch = format!("{}{}", parent_prefix, if last { "└── " } else { "├── " });
+    let child  = format!("{}{}", parent_prefix, if last { "    " } else { "│   " });
+    (branch, child)
+}
+
+fn scalar_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -515,15 +546,13 @@ fn parse_dialect_str(s: &str) -> Option<Dialect> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Batch validation helpers
+// Batch validation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Validate all `;`-separated statements and report per-statement results.
 fn validate_batch(sql: &str, dialect: &Dialect, quiet: bool) -> i32 {
-    // Split on `;` preserving content
     let statements: Vec<&str> = sql
         .split(';')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -532,19 +561,19 @@ fn validate_batch(sql: &str, dialect: &Dialect, quiet: bool) -> i32 {
         return 0;
     }
 
-    let mut errors = 0;
+    let mut errors = 0usize;
     for (i, stmt) in statements.iter().enumerate() {
         let n = i + 1;
-        let full = format!("{};", stmt);
-        match parse(&full, dialect) {
+        let preview: String = stmt.chars().take(72).collect();
+        match parse(&format!("{stmt};"), dialect) {
             Ok(_) => {
                 if !quiet {
-                    println!("{} Statement {n}: {}", "✓".green().bold(), stmt.chars().take(60).collect::<String>().dimmed());
+                    println!("{} #{n}: {}", "✓".green().bold(), preview.dimmed());
                 }
             }
             Err(e) => {
                 errors += 1;
-                eprintln!("{} Statement {n}: {}\n     {}", "✗".red().bold(), stmt.chars().take(60).collect::<String>(), e.red());
+                eprintln!("{} #{n}: {}\n     └─ {}", "✗".red().bold(), preview, e.red());
             }
         }
     }
@@ -552,11 +581,8 @@ fn validate_batch(sql: &str, dialect: &Dialect, quiet: bool) -> i32 {
     if !quiet {
         let total = statements.len();
         let ok = total - errors;
-        println!(
-            "\n{} {ok}/{total} statement{} valid",
-            if errors == 0 { "✓".green().bold() } else { "✗".red().bold() },
-            if total == 1 { "" } else { "s" }
-        );
+        let mark = if errors == 0 { "✓".green().bold() } else { "✗".red().bold() };
+        println!("\n{mark} {ok}/{total} statement{} valid", if total == 1 { "" } else { "s" });
     }
 
     if errors > 0 { 1 } else { 0 }
@@ -567,24 +593,17 @@ fn validate_batch(sql: &str, dialect: &Dialect, quiet: bool) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let cli = Cli::parse();
-
-    let exit_code = match cli.command {
-        // ── format ─────────────────────────────────────────────────────────
+    let exit_code = match Cli::parse().command {
         Command::Format { sql, dialect, file } => {
             match resolve_sql(sql, file) {
                 Err(e) => { eprintln!("{e}"); 1 }
                 Ok(src) => match parse(&src, &dialect) {
                     Err(e) => { eprintln!("{} {e}", "Parse error:".red().bold()); 1 }
-                    Ok(stmts) => {
-                        for stmt in &stmts { println!("{stmt}"); }
-                        0
-                    }
+                    Ok(stmts) => { for s in &stmts { println!("{s}"); } 0 }
                 }
             }
         }
 
-        // ── ast ────────────────────────────────────────────────────────────
         Command::Ast { sql, dialect, file, output } => {
             match resolve_sql(sql, file) {
                 Err(e) => { eprintln!("{e}"); 1 }
@@ -598,7 +617,6 @@ fn main() {
             }
         }
 
-        // ── validate ───────────────────────────────────────────────────────
         Command::Validate { sql, dialect, file, quiet } => {
             match resolve_sql(sql, file) {
                 Err(e) => { eprintln!("{e}"); 1 }
